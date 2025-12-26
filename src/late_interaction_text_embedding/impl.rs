@@ -20,7 +20,7 @@ use ort::{
 #[cfg(feature = "hf-hub")]
 use std::path::PathBuf;
 use std::thread::available_parallelism;
-use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
+use tokenizers::{AddedToken, PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 
 #[cfg(feature = "hf-hub")]
 use super::LateInteractionInitOptions;
@@ -72,10 +72,40 @@ impl LateInteractionTextEmbedding {
             .with_intra_threads(threads)?
             .commit_from_file(model_file_reference)?;
 
-        let tokenizer = load_tokenizer_hf_hub(model_repo.clone(), max_length)?;
+        // Adjust max_length to leave room for marker token
+        let adjusted_max_length = if max_length > 1 {
+            max_length - 1
+        } else {
+            max_length
+        };
 
-        // For queries, use a different max length (typically 32 for ColBERT)
-        let query_tokenizer = load_tokenizer_hf_hub(model_repo, DEFAULT_QUERY_MAX_LENGTH)?;
+        let tokenizer = load_tokenizer_hf_hub(model_repo.clone(), adjusted_max_length)?;
+
+        // For queries, use separate tokenizer with MASK padding
+        let mut query_tokenizer = load_tokenizer_hf_hub(model_repo.clone(), adjusted_max_length)?;
+
+        // Get mask token and configure query tokenizer
+        let (mask_token, mask_token_id) = Self::get_mask_token_for_model(&model_name, &tokenizer)?;
+
+        // Configure query tokenizer to pad with MASK tokens to MIN_QUERY_LENGTH
+        query_tokenizer = query_tokenizer
+            .with_padding(Some(PaddingParams {
+                strategy: PaddingStrategy::Fixed(DEFAULT_QUERY_MAX_LENGTH),
+                pad_token: mask_token.clone(),
+                pad_id: mask_token_id,
+                ..Default::default()
+            }))
+            .clone();
+
+        // Get marker token IDs
+        let (query_marker_id, doc_marker_id) =
+            Self::get_marker_token_ids_for_model(&model_name)?;
+
+        // Build skip list from punctuation
+        let skip_list = Self::build_skip_list(&tokenizer);
+
+        // Get pad token ID
+        let pad_token_id = tokenizer.get_padding().map(|p| p.pad_id).unwrap_or(0);
 
         Ok(Self::new(
             tokenizer,
@@ -84,6 +114,11 @@ impl LateInteractionTextEmbedding {
             LateInteractionTextEmbedding::get_quantization_mode(&model_name),
             model_info.output_key.clone(),
             model_info.dim,
+            mask_token_id,
+            pad_token_id,
+            skip_list,
+            query_marker_id,
+            doc_marker_id,
         ))
     }
 
@@ -108,8 +143,40 @@ impl LateInteractionTextEmbedding {
             .with_intra_threads(threads)?
             .commit_from_memory(&model.onnx_file)?;
 
-        let tokenizer = load_tokenizer(model.tokenizer_files.clone(), max_length)?;
-        let query_tokenizer = load_tokenizer(model.tokenizer_files, query_max_length)?;
+        let adjusted_max_length = if max_length > 1 {
+            max_length - 1
+        } else {
+            max_length
+        };
+
+        let tokenizer = load_tokenizer(model.tokenizer_files.clone(), adjusted_max_length)?;
+
+        // Query tokenizer with MASK padding
+        let mut query_tokenizer = load_tokenizer(model.tokenizer_files.clone(), adjusted_max_length)?;
+
+        // Default MASK token for user-defined models
+        let mask_token = "[MASK]".to_string();
+        let mask_token_id = tokenizer
+            .get_vocab(true)
+            .get(&mask_token)
+            .copied()
+            .unwrap_or(0);
+
+        query_tokenizer = query_tokenizer
+            .with_padding(Some(PaddingParams {
+                strategy: PaddingStrategy::Fixed(query_max_length),
+                pad_token: mask_token,
+                pad_id: mask_token_id,
+                ..Default::default()
+            }))
+            .clone();
+
+        // Default marker tokens
+        let query_marker_id = 1;
+        let doc_marker_id = 2;
+
+        let skip_list = Self::build_skip_list(&tokenizer);
+        let pad_token_id = tokenizer.get_padding().map(|p| p.pad_id).unwrap_or(0);
 
         // Infer dimension from model output
         let dim = Self::infer_dimension(&session)?;
@@ -121,10 +188,16 @@ impl LateInteractionTextEmbedding {
             model.quantization,
             model.output_key,
             dim,
+            mask_token_id,
+            pad_token_id,
+            skip_list,
+            query_marker_id,
+            doc_marker_id,
         ))
     }
 
     /// Private method to return an instance
+    #[allow(clippy::too_many_arguments)]
     fn new(
         tokenizer: Tokenizer,
         query_tokenizer: Tokenizer,
@@ -132,6 +205,11 @@ impl LateInteractionTextEmbedding {
         quantization: QuantizationMode,
         output_key: Option<OutputKey>,
         dim: usize,
+        mask_token_id: u32,
+        pad_token_id: u32,
+        skip_list: Vec<u32>,
+        query_marker_token_id: u32,
+        document_marker_token_id: u32,
     ) -> Self {
         let need_token_type_ids = session
             .inputs
@@ -146,7 +224,59 @@ impl LateInteractionTextEmbedding {
             quantization,
             output_key,
             dim,
+            mask_token_id,
+            pad_token_id,
+            skip_list,
+            query_marker_token_id,
+            document_marker_token_id,
         }
+    }
+
+    /// Build skip list from punctuation characters
+    fn build_skip_list(tokenizer: &Tokenizer) -> Vec<u32> {
+        let punctuation = "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~";
+        let mut skip_list = Vec::new();
+
+        for ch in punctuation.chars() {
+            let encoded = tokenizer.encode(ch.to_string(), false);
+            if let Ok(enc) = encoded {
+                if let Some(&id) = enc.get_ids().first() {
+                    skip_list.push(id);
+                }
+            }
+        }
+
+        skip_list
+    }
+
+    /// Get mask token and ID for the model
+    fn get_mask_token_for_model(
+        model_name: &LateInteractionModel,
+        tokenizer: &Tokenizer,
+    ) -> Result<(String, u32)> {
+        let mask_token = match model_name {
+            LateInteractionModel::JinaColBERTv2 => "<mask>",
+            _ => "[MASK]",
+        }
+        .to_string();
+
+        let mask_token_id = tokenizer
+            .get_vocab(true)
+            .get(&mask_token)
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("Mask token {} not found in vocabulary", mask_token))?;
+
+        Ok((mask_token, mask_token_id))
+    }
+
+    /// Get marker token IDs for query and document
+    fn get_marker_token_ids_for_model(
+        model_name: &LateInteractionModel,
+    ) -> Result<(u32, u32)> {
+        Ok(match model_name {
+            LateInteractionModel::JinaColBERTv2 => (250002, 250003),
+            _ => (1, 2), // ColBERT v2.0 and AnswerAI
+        })
     }
 
     /// Return the LateInteractionTextEmbedding model's directory from cache or remote retrieval
@@ -277,49 +407,78 @@ impl LateInteractionTextEmbedding {
             &self.tokenizer
         };
 
+        let marker_token_id = if is_query {
+            self.query_marker_token_id
+        } else {
+            self.document_marker_token_id
+        };
+
         let mut all_embeddings = Vec::with_capacity(texts.len());
 
         for batch in texts.chunks(batch_size) {
             // Encode the texts in the batch
             let inputs = batch.iter().map(|text| text.as_ref()).collect();
-            let encodings = tokenizer.encode_batch(inputs, true).map_err(|e| {
+            let mut encodings = tokenizer.encode_batch(inputs, true).map_err(|e| {
                 anyhow::Error::msg(e.to_string()).context("Failed to encode the batch.")
             })?;
 
-            // Extract the encoding length and batch size
+            // Preprocess: Insert marker token at position 1
+            for encoding in &mut encodings {
+                let mut ids = encoding.get_ids().to_vec();
+                let mut attention_mask = encoding.get_attention_mask().to_vec();
+
+                // Insert marker token after CLS (position 1)
+                ids.insert(1, marker_token_id);
+                attention_mask.insert(1, 1);
+
+                // Update the encoding (we'll need to recreate the arrays)
+                // Note: This is a simplified approach - tokenizers crate doesn't easily support mutation
+            }
+
+            // Extract the encoding length and batch size (after inserting marker)
             let encoding_length = encodings
                 .first()
                 .ok_or_else(|| anyhow::anyhow!("Tokenizer returned empty encodings"))?
-                .len();
-            let current_batch_size = batch.len();
+                .len()
+                + 1; // +1 for marker token
 
+            let current_batch_size = batch.len();
             let max_size = encoding_length * current_batch_size;
 
-            // Preallocate arrays with the maximum size
+            // Preallocate arrays
             let mut ids_array = Vec::with_capacity(max_size);
             let mut mask_array = Vec::with_capacity(max_size);
             let mut type_ids_array = Vec::with_capacity(max_size);
+            let mut original_ids = Vec::with_capacity(current_batch_size);
 
-            encodings.iter().for_each(|encoding| {
-                let ids = encoding.get_ids();
-                let mask = encoding.get_attention_mask();
-                let type_ids = encoding.get_type_ids();
+            for encoding in encodings.iter() {
+                let mut ids = encoding.get_ids().to_vec();
+                let mut mask = encoding.get_attention_mask().to_vec();
+                let mut type_ids = encoding.get_type_ids().to_vec();
+
+                // Store original IDs for post-processing
+                original_ids.push(ids.clone());
+
+                // Insert marker token at position 1
+                ids.insert(1, marker_token_id);
+                mask.insert(1, 1);
+                type_ids.insert(1, 0);
 
                 ids_array.extend(ids.iter().map(|x| *x as i64));
                 mask_array.extend(mask.iter().map(|x| *x as i64));
                 type_ids_array.extend(type_ids.iter().map(|x| *x as i64));
-            });
+            }
 
             let inputs_ids_array =
                 Array::from_shape_vec((current_batch_size, encoding_length), ids_array)?;
-            let attention_mask_array =
+            let mut attention_mask_array =
                 Array::from_shape_vec((current_batch_size, encoding_length), mask_array)?;
             let token_type_ids_array =
                 Array::from_shape_vec((current_batch_size, encoding_length), type_ids_array)?;
 
             let mut session_inputs = ort::inputs![
-                "input_ids" => Value::from_array(inputs_ids_array)?,
-                "attention_mask" => Value::from_array(attention_mask_array)?,
+                "input_ids" => Value::from_array(inputs_ids_array.clone())?,
+                "attention_mask" => Value::from_array(attention_mask_array.clone())?,
             ];
 
             if self.need_token_type_ids {
@@ -367,32 +526,82 @@ impl LateInteractionTextEmbedding {
 
             // Extract the array from the tensor
             let array = output_tensor.try_extract_tensor::<f32>()?;
-            let array_view = array.view();
+            let mut array_view = array.view().to_owned();
 
-            // Convert to Vec<MultiVectorEmbedding>
-            // Expected shape: [batch_size, sequence_length, embedding_dim]
-            let shape = array_view.shape();
-            if shape.len() != 3 {
-                return Err(anyhow::anyhow!(
-                    "Expected 3D tensor output, got shape {:?}",
-                    shape
-                ));
-            }
-
-            let batch_size_out = shape[0];
-            let seq_len = shape[1];
-            let emb_dim = shape[2];
-
-            for i in 0..batch_size_out {
-                let mut doc_embedding = Vec::with_capacity(seq_len);
-                for j in 0..seq_len {
-                    let mut token_embedding = Vec::with_capacity(emb_dim);
-                    for k in 0..emb_dim {
-                        token_embedding.push(array_view[[i, j, k]]);
+            // Post-process based on whether this is a query or document
+            if !is_query {
+                // Document post-processing
+                // 1. Zero out attention mask for skip_list tokens and pad tokens
+                for (i, ids) in original_ids.iter().enumerate() {
+                    for (j, &token_id) in ids.iter().enumerate() {
+                        let j_adjusted = j + 1; // Account for marker token insertion
+                        if j_adjusted < encoding_length {
+                            if self.skip_list.contains(&token_id) || token_id == self.pad_token_id
+                            {
+                                attention_mask_array[[i, j_adjusted]] = 0;
+                            }
+                        }
                     }
-                    doc_embedding.push(token_embedding);
                 }
-                all_embeddings.push(doc_embedding);
+
+                // 2. Multiply embeddings by attention mask
+                for i in 0..current_batch_size {
+                    for j in 0..encoding_length {
+                        let mask_val = attention_mask_array[[i, j]] as f32;
+                        for k in 0..self.dim {
+                            array_view[[i, j, k]] *= mask_val;
+                        }
+                    }
+                }
+
+                // 3. L2 normalize each token embedding
+                for i in 0..current_batch_size {
+                    for j in 0..encoding_length {
+                        let mut norm = 0.0f32;
+                        for k in 0..self.dim {
+                            norm += array_view[[i, j, k]] * array_view[[i, j, k]];
+                        }
+                        norm = norm.sqrt().max(1e-12);
+
+                        for k in 0..self.dim {
+                            array_view[[i, j, k]] /= norm;
+                        }
+                    }
+                }
+
+                // 4. Return only tokens where attention_mask == 1
+                for i in 0..current_batch_size {
+                    let mut doc_embedding = Vec::new();
+                    for j in 0..encoding_length {
+                        if attention_mask_array[[i, j]] == 1 {
+                            let mut token_embedding = Vec::with_capacity(self.dim);
+                            for k in 0..self.dim {
+                                token_embedding.push(array_view[[i, j, k]]);
+                            }
+                            doc_embedding.push(token_embedding);
+                        }
+                    }
+                    all_embeddings.push(doc_embedding);
+                }
+            } else {
+                // Query post-processing: return all embeddings as-is
+                // For JinaColbert, attention mask is always 1
+                if matches!(self.query_marker_token_id, 250002) {
+                    // JinaColbert
+                    attention_mask_array.fill(1);
+                }
+
+                for i in 0..current_batch_size {
+                    let mut query_embedding = Vec::new();
+                    for j in 0..encoding_length {
+                        let mut token_embedding = Vec::with_capacity(self.dim);
+                        for k in 0..self.dim {
+                            token_embedding.push(array_view[[i, j, k]]);
+                        }
+                        query_embedding.push(token_embedding);
+                    }
+                    all_embeddings.push(query_embedding);
+                }
             }
         }
 

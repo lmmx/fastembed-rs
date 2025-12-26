@@ -115,4 +115,9 @@ pub struct LateInteractionTextEmbedding {
     pub(crate) quantization: QuantizationMode,
     pub(crate) output_key: Option<OutputKey>,
     pub(crate) dim: usize,
+    pub(crate) mask_token_id: u32,
+    pub(crate) pad_token_id: u32,
+    pub(crate) skip_list: Vec<u32>,
+    pub(crate) query_marker_token_id: u32,
+    pub(crate) document_marker_token_id: u32,
 }
