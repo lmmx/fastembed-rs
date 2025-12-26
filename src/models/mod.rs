@@ -1,6 +1,7 @@
 use crate::ModelInfo;
 
 pub mod image_embedding;
+pub mod late_interaction;
 pub mod model_info;
 pub mod quantization;
 pub mod reranking;

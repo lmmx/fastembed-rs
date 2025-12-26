@@ -58,6 +58,7 @@ mod common;
 #[cfg(feature = "image-models")]
 mod image_embedding;
 mod init;
+mod late_interaction_text_embedding;
 mod models;
 pub mod output;
 mod pooling;
@@ -69,7 +70,8 @@ pub use ort::execution_providers::ExecutionProviderDispatch;
 
 pub use crate::common::{get_cache_dir, Embedding, Error, SparseEmbedding, TokenizerFiles};
 pub use crate::models::{
-    model_info::ModelInfo, model_info::RerankerModelInfo, quantization::QuantizationMode,
+    late_interaction::LateInteractionModel, model_info::ModelInfo,
+    model_info::RerankerModelInfo, quantization::QuantizationMode,
 };
 pub use crate::output::{EmbeddingOutput, OutputKey, OutputPrecedence, SingleBatchOutput};
 pub use crate::pooling::Pooling;
@@ -105,3 +107,10 @@ pub use crate::reranking::{
     OnnxSource, RerankInitOptions, RerankInitOptionsUserDefined, RerankResult, TextRerank,
     UserDefinedRerankingModel,
 };
+
+// For Late Interaction Text Embedding
+pub use crate::late_interaction_text_embedding::{
+    LateInteractionInitOptions, LateInteractionTextEmbedding, MultiVectorEmbedding,
+    UserDefinedLateInteractionModel,
+};
+pub use crate::late_interaction_text_embedding::muvera::Muvera;
