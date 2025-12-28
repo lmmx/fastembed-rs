@@ -1,81 +1,67 @@
 # 2025: Unwarping, Inferring, Decomposing
 
-This year I worked on three problems that turned out to be the same problem: how do you recover structure from data that's hiding it?
-
-Page images hide their text behind geometric distortion. JSON hides its schema behind its values. Embeddings hide their topics behind 384 dimensions of float soup. The work was: build tools that extract what's actually there.
-
----
+Three projects this year that turned out to be variations on the same question: how do you recover structure from data that's hiding it?
 
 ## 1. Unwarping unwrapped
 
-I inherited page-dewarp as Python 2 code back in 2016. Matt Zucker wrote the original as a companion to his blog post on the cubic sheet model — a physically grounded approach to document dewarping that treats the page as a bent surface rather than a pixel-shuffle problem.
+I "inherited" page-dewarp as Python 2 code and went to some lengths to "inflate" it into proper software. That re-maintenance phase was done mid-2023 but I returned this year and did major renovations.
 
-By mid-2023 I'd done the maintenance work: Python 3, CLI, pip installable, modular. But the core remained Zucker's original optimisation loop, and that loop was slow. Around 12 seconds per image on my hardware.
+Quick recap on the cubic sheet model: Matt Zucker's original blog post treats a photographed page as a bent surface rather than a pixel-shuffle problem. You fit cubic Hermite splines to detected text contours, then solve for the coefficients that best explain where the text ended up when projected through your camera model. Physically grounded, geometrically motivated.
 
-This year I went back and did the renovation properly.
+Zucker left a tip in his blog post that this was a non-linear least squares optimisation. The original code used SciPy's Powell method (derivative-free), which works but leaves performance on the table. I rewrote the objective in JAX for autodiff, switched to L-BFGS-B, and function evaluations dropped by 100-700x depending on the image. Wall clock: 12 seconds down to under 1.
 
-The cubic sheet model fits a parametric surface to detected text contours. You're solving for the coefficients of cubic Hermite splines that, when projected through your camera model, best explain where the text ended up. It's non-linear least squares — Zucker noted this in his original post as an "exercise left for the reader."
+Batch processing compounds this. JAX's JIT has warmup cost so single images don't see the full benefit, but for a stack of scans (the actual use case) you get 3-5x additional from parallelisation. 40-image batch goes from minutes to seconds.
 
-I took him up on it. The original used SciPy's Powell method, which is derivative-free. Works, but you're leaving performance on the table. I rewrote the objective function in JAX, which gave me autodiff for free, then switched to L-BFGS-B. Function evaluations dropped by 100-700x depending on the image. Wall clock time went from 12+ seconds to under a second.
-
-The batch processing story is its own thing. JAX's JIT compilation means you pay a warmup cost, so single images don't see the full benefit. But when you're processing a stack of scans — which is the actual use case — you get 3-5x additional speedup from parallelisation on top of the per-image gains. For a 40-image batch I was seeing total time drop from minutes to seconds.
-
-One gripe, while I'm here: the deep learning literature on document dewarping has largely moved to grid-based methods. You train a network to predict a pixel displacement field, apply it, done. These work fine on their training distribution, but they're not modelling the actual physics. A page is a surface. It bends according to material properties. The spline-based approach is slower to run (though not anymore, really) but it's *grounded* — you're recovering geometry, not learning a lookup table. I see papers benchmarking on increasingly contrived distortions and I think: nobody is scanning crumpled paper. We want books.
-
----
+Minor gripe while I'm here: homography estimation with splines is physically grounded and modern DL research has begun to lay its own Goodhart trap wherein grid-based dewarping methods are privileged. You train a network to predict a pixel displacement field and that's it. These work on their training distribution but they're not modelling actual physics. A page is a surface, it bends according to material properties. The spline approach is grounded, you're recovering geometry not learning a lookup table. I see papers benchmarking on increasingly contrived distortions and I think: nobody is scanning crumpled up pages, we want *books*.
 
 ## 2. Detecting the data model
 
-The other major project this year was schema inference, which started as Wikidata preprocessing but became its own thing.
+This started as Wikidata preprocessing but became its own thing. Three intertwined packages: genson-core, avrotize-rs, polars-genson.
 
-Three packages interlock here: **genson-core** for the inference engine, **avrotize-rs** for schema translation, and **polars-genson** for DataFrame integration. The goal: given a pile of JSON, tell me what shape it has.
+Having already been a passionate Pydantic modeller, I was attuned to data models. The gap I kept hitting: I have data, I don't have a schema, I need one before I can do anything useful. genson-core infers the schema from JSON (fields, types, optional vs required, mappings). The mappings part was actually the most significant.
 
-I'd already spent years as a Pydantic enthusiast, so I was primed to think about data models. But the gap I kept hitting was: I have data, I don't have a schema, and I need one before I can do anything useful. Existing tools would give you field names and basic types. What I needed was richer: optional vs required, nested structure, and critically, *map types*.
+I saw this in Wikidata where scalar string fields keyed by language became massive mappings which were mostly null. A field like `labels` that in principle contains a string per language, but in practice most entities have labels in 3-5 languages out of hundreds possible. If you flatten that naively you get hundreds of mostly-null columns. If you recognise it as a map (`Dict[str, str]`) you preserve the structure without the explosion. This is a schema type that can only be represented by map type inference, and I found that genson-rs was unable to do this, so I made my own extension based on it (essentially reprocessing the genson-rs dtype inference).
 
-The map inference is what made this worth building. I ran into it with Wikidata: you'd have a field like `labels` that in principle contains a string per language. In practice, most entities have labels in 3-5 languages out of hundreds possible. If you flatten that naively you get hundreds of mostly-null columns. If you recognise it as a map — a `Dict[str, str]` — you preserve the structure without the explosion.
+The CLI tool (genson-cli) exposes it for command-line use. polars-genson wraps it as a Polars plugin so you can do schema inference directly on string columns in a DataFrame.
 
-genson-rs, which I forked from, couldn't do this. It would see the nested structure but not recognise the map pattern. So I wrote genson-core as an extension layer that reprocesses the type inference and catches these cases. The CLI tool (genson-cli) exposes it for command-line use; polars-genson wraps it as a Polars plugin so you can do schema inference directly on string columns in a DataFrame.
+avrotize-rs handles schema translation. JSON Schema is a good interchange format but Avro is what you actually want for downstream processing (typed, compact, plays well with columnar storage). I ported it from the Python original because I wanted it fast and working with the Rust genson-core without crossing language boundaries.
 
-The avrotize-rs piece handles schema translation. JSON Schema is a good interchange format but Avro is what you actually want for downstream processing — it's typed, it's compact, it plays well with columnar storage. avrotize-rs takes a JSON Schema and emits an Avro schema. I ported it from the Python original because I wanted it fast and I wanted it to work with the Rust genson-core without crossing language boundaries.
-
-The three together form a pipeline: raw JSON → inferred JSON Schema → Avro schema → typed processing. What I'm actually building is constraint discovery. A schema isn't describing what your data *is* — it's describing what your data *isn't allowed to be*. Once you have that, you can validate, you can generate types, you can catch drift.
-
----
+The three together form a pipeline: raw JSON → inferred JSON Schema → Avro schema → typed processing. What I'm actually doing is constraint discovery. A schema isn't describing what your data *is*, it's describing what your data *isn't allowed to be*.
 
 ## 3. Embeddings and their decomposition
 
-Text embeddings felt like they'd only be useful to me if they lived on my compute platform of choice, Polars. As I put it at the time: bring the embeddings to the DataFrame.
+### 3a. polars-fastembed
 
-### 3a: polars-fastembed
+Text embeddings are cool but to me I sensed they'd only be truly useful if they were on my compute platform of choice, Polars. Or as I put it at the time: bring the embeddings to the DataFrame.
 
-The "embeddings as a service" abstraction never sat right with me. If the models are open, if inference is fast enough, why am I paying someone to run a forward pass? What I wanted was embeddings as a DataFrame operation — a column of strings goes in, a column of vectors comes out, and it happens locally.
+The "embeddings as a service" abstraction is unpleasant. They can be computed locally if fast enough, and paying for them is senseless when there are many high quality open source ones. What I wanted was embeddings as a DataFrame operation: column of strings in, column of vectors out, happens locally.
 
-polars-fastembed wraps fastembed-rs, which is itself a clean Rust embedding library. My main contribution to fastembed-rs this year was adding support for Snowflake's Arctic Embed models, including the quantised variants. There was initial pushback ("this package doesn't intend to keep feature parity with the Python version") but that turned out to mean "send PRs not issues," so I did.
+polars-fastembed wraps fastembed-rs. My main contribution to fastembed-rs this year was adding support for Snowflake's Arctic Embed models including the quantised variants. Initial response was "this package doesn't intend to keep feature parity with the Python version" but this just meant "send PRs not issues" so I did.
 
-The performance story matters here. My benchmark is embedding all 708 Python PEPs — it's a realistic corpus size and the documents vary in length. With the base MiniLM model on CPU, this took around a minute. With Arctic Embed XS on GPU via CUDA ONNX runtime, it dropped to 5 seconds. That's the difference between "I'll run this overnight" and "I'll run this now."
+The performance story matters. My benchmark is embedding all 708 Python PEPs (realistic corpus size, documents vary in length). With the base MiniLM model on CPU this took around a minute. With Arctic Embed XS on GPU via CUDA ONNX runtime, 5 seconds. That's the difference between viable and not.
 
-I also made polars-luxical, wrapping Datology's Luxical One model. That one does the same benchmark in under a second *on CPU*. I haven't explored it deeply — the model is newer and less understood — but the speed is striking enough that I wanted it available.
+I also made polars-luxical wrapping Datology's Luxical One model. That one does the same benchmark in under a second on CPU which is some doing. I haven't explored it much but did make polars-luxical to use it.
 
-(There's an existing polars-candle library that I wanted to benchmark against, but last I checked it didn't work. Unmaintained, I think.)
+(There's an existing polars-candle library I wanted to bench against but last I checked it didn't function. Unmaintained I think.)
 
-### 3b: picard-ica
+### 3b. picard-ica
 
-Once you have embeddings, you can do two things with them: retrieve (query → cosine similarity → ranked results) or decompose (find the latent topics). I wanted both.
+Once you have embeddings you either want to "retrieve" (embedded query → cosine distance → ranked results) or "decompose" for topic modelling. I tried decomposition and found it useful enough that I developed picard-ica.
 
-ICA — Independent Component Analysis — casts topic modelling as source separation. If embeddings tell you where something is in semantic space, decomposition tells you what the axes of that space actually are. You're separating topics the way you'd separate vocals from a recording with multiple speakers.
+Embeddings tell you where something is in semantic space (its "meaning"). Decomposition separates out what the dimensions of that space actually are. You can treat it as an optimisation task: how to separate out the components of meaning as you would separate colours of mixed paint or individual vocals in a multi-speaker recording (cocktail party problem).
 
-I ported PICARD to Rust. PICARD stands for Preconditioned ICA for Real Data — the "preconditioned" part refers to whitening the data (making covariance spherical) and using approximate Hessian information to speed up convergence. It's more robust than FastICA on real-world data, and depending on settings can reproduce FastICA or InfoMax results.
+PICARD stands for Preconditioned ICA for Real Data. The preconditioning refers to whitening (making the covariance spherical, i.e. isotropic baseline variance) and using approximate Hessian to speed up convergence. It handles real world data better than alternatives. Depending on settings the results can be equivalent to FastICA or InfoMax (see the docs at mind-inria/picard).
 
-The performance dynamics are interesting. ICA is iterative, and the algorithm has a maximum iteration count (usually 200). If your implementation is correct, you converge in 20-30 iterations. If you've got a bug somewhere — wrong gradient, bad preconditioning — you hit the max. So correctness is required for speed. You can't brute-force your way past a broken algorithm. The LAPACK calls at the bottom are already fast; what matters is not making them run 10x more than necessary.
+ICA can be cast as likelihood maximisation for an unmixing matrix W (separating out the sources, in this case the topics). We approximate the 2nd order curvature of the objective function.
 
-I tried a few Rust linear algebra backends. linfa/ndarray worked well. faer is appealing in theory (pure Rust, no C dependencies) but I saw worse performance in practice and development there seems paused. (The main faer developer is active in facet-rs, so I'll keep an eye on it.)
+Speed is important and there's a cool property here: correctness is required for speed. If you mess any of it up your algo will simply not converge fast. Since the algo ultimately calls LAPACK, I saw this perf as essentially being bottlenecked by correctness. If you get the algo wrong and it hits the 200 max iterations rather than 20 or 30 you can't possibly do that faster no matter how speedy your implementation language might be. In practice it's faster even at the same number of iterations, though I had to walk back some "improvements" which made each iteration slower as overall it wasn't worth the perf hit for a chance at better warmup. My sense is I did it correctly; the convergence step counts don't match because the random number generation engines differ.
 
-The picard-ica crate now underlies topic modelling in polars-fastembed. You embed your documents, call the decomposition method, and get topic assignments. Before I integrated it properly, ICA was a bottleneck in arxiv-explorer. Now it's not.
+I tried a few Rust linear algebra backends. linfa/ndarray performed well. faer is nice in theory (pure Rust) but I saw worse perf and didn't want to take the hit. Looks like development is paused there but the developer is also active in facet-rs so I'll be watching that.
 
----
+Since picard-ica is a Rust crate I just dropped it into polars-fastembed and it now underlies the topic modelling. Source separation on text embedding vectors directly to give topics. Before I integrated it properly, ICA was a bottleneck in arxiv-explorer. Now it's not.
 
-## The common thread
+## The thread
 
-Dewarping recovers geometry from images. Schema inference recovers structure from values. ICA recovers topics from embeddings. These are all the same operation: there's signal hidden in noisy or high-dimensional data, and you want to extract it.
+Dewarping recovers geometry from images. Schema inference recovers structure from values. ICA recovers topics from embeddings. Signal hidden in noisy or high-dimensional data, and you extract it.
 
-I don't have a grand unified theory. But I notice I keep building the same kind of tool: something that takes data in an inconvenient form and reveals the structure that was always there. Maybe that's just what programming is. Maybe it's a particular disposition. Either way, it's what I'll keep doing.
+I keep building the same kind of tool: something that takes data in an inconvenient form and reveals the structure that was already there.
