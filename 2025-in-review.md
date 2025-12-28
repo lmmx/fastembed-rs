@@ -1,8 +1,12 @@
-# 2025: Unwarping, Inferring, Decomposing
+---
+title: "2025: Unwarping, Inferring, Decomposing"
+date: Dec 2025
+desc: Structure recovery in three registers
+---
 
 Three projects this year that turned out to be variations on the same question: how do you recover structure from data that's hiding it?
 
-## 1. Unwarping unwrapped
+### 1. Unwarping unwrapped
 
 I "inherited" page-dewarp as Python 2 code and went to some lengths to "inflate" it into proper software. That re-maintenance phase was done mid-2023 but I returned this year and did major renovations.
 
@@ -14,7 +18,7 @@ Batch processing compounds this. JAX's JIT has warmup cost so single images don'
 
 Minor gripe while I'm here: homography estimation with splines is physically grounded and modern DL research has begun to lay its own Goodhart trap wherein grid-based dewarping methods are privileged. You train a network to predict a pixel displacement field and that's it. These work on their training distribution but they're not modelling actual physics. A page is a surface, it bends according to material properties. The spline approach is grounded, you're recovering geometry not learning a lookup table. I see papers benchmarking on increasingly contrived distortions and I think: nobody is scanning crumpled up pages, we want *books*.
 
-## 2. Detecting the data model
+### 2. Detecting the data model
 
 This started as Wikidata preprocessing but became its own thing. Three intertwined packages: genson-core, avrotize-rs, polars-genson.
 
@@ -28,9 +32,9 @@ avrotize-rs handles schema translation. JSON Schema is a good interchange format
 
 The three together form a pipeline: raw JSON → inferred JSON Schema → Avro schema → typed processing. What I'm actually doing is constraint discovery. A schema isn't describing what your data *is*, it's describing what your data *isn't allowed to be*.
 
-## 3. Embeddings and their decomposition
+### 3. Embeddings and their decomposition
 
-### 3a. polars-fastembed
+#### polars-fastembed
 
 Text embeddings are cool but to me I sensed they'd only be truly useful if they were on my compute platform of choice, Polars. Or as I put it at the time: bring the embeddings to the DataFrame.
 
@@ -44,7 +48,7 @@ I also made polars-luxical wrapping Datology's Luxical One model. That one does 
 
 (There's an existing polars-candle library I wanted to bench against but last I checked it didn't function. Unmaintained I think.)
 
-### 3b. picard-ica
+#### picard-ica
 
 Once you have embeddings you either want to "retrieve" (embedded query → cosine distance → ranked results) or "decompose" for topic modelling. I tried decomposition and found it useful enough that I developed picard-ica.
 
@@ -60,7 +64,7 @@ I tried a few Rust linear algebra backends. linfa/ndarray performed well. faer i
 
 Since picard-ica is a Rust crate I just dropped it into polars-fastembed and it now underlies the topic modelling. Source separation on text embedding vectors directly to give topics. Before I integrated it properly, ICA was a bottleneck in arxiv-explorer. Now it's not.
 
-## The thread
+### The thread
 
 Dewarping recovers geometry from images. Schema inference recovers structure from values. ICA recovers topics from embeddings. Signal hidden in noisy or high-dimensional data, and you extract it.
 
