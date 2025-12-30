@@ -38,13 +38,15 @@ For reference, the core `onnxruntime/core/` directory is about **33 MB**.
 - `cpu/attnlstm/*` - LSTM attention variants
 - `cpu/aten_ops/*` - PyTorch ATen compatibility
 
-## Binary Size Context
+## Binary Size Reference
 
-ONNX Runtime Python wheel sizes (CPU-only, v1.23.2):
-- Linux x86-64: 17.4 MB
-- Windows x86-64: 13.5 MB
-- macOS x86-64: 19.2 MB
-- macOS ARM64: 17.2 MB
+**ONNX Runtime v1.22.0 official release (CPU-only, Linux x64):**
+- `libonnxruntime.so.1.22.0`: **21 MB** (uncompressed shared library)
+- Compressed tarball: 7.4 MB
+
+**fastembed-rs build artifacts (debug build):**
+- `libort_sys-*.rlib`: 95 MB (Rust static library with ONNX Runtime)
+- `libfastembed.rlib`: 28 MB
 
 ## Estimated Savings
 
@@ -59,8 +61,10 @@ ONNX Runtime Python wheel sizes (CPU-only, v1.23.2):
 
 **Binary size estimate:**
 - CPU contrib_ops source is ~4.3% of total source (1.5 MB / 34.5 MB)
-- 40% of that is prunable for embeddings
-- **Estimated savings: 0.6-1.2 MB** (3-7% of ~17 MB binary)
+- 40% of that is prunable for embeddings (~1.7% of total)
+- **Estimated savings: ~0.4 MB** (~1.7% of 21 MB binary)
+
+Note: Source code size to binary size ratio is not 1:1. Actual savings require measurement via custom build.
 
 ### CUDA builds:
 
@@ -106,3 +110,4 @@ To get exact binary size savings:
 - [ONNX Runtime Custom build](https://onnxruntime.ai/docs/build/custom.html)
 - [Contrib Ops Wiki](https://github.com/microsoft/onnxruntime/wiki/Contrib-Ops)
 - [ort crate](https://github.com/pykeio/ort)
+- [ONNX Runtime releases](https://github.com/microsoft/onnxruntime/releases)
