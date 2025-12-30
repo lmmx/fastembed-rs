@@ -1,73 +1,91 @@
 # ONNX Runtime contrib_ops Size Analysis for fastembed-rs
 
-This document analyzes the binary size savings from disabling contrib_ops in ONNX Runtime for embedding model use cases.
+This document analyzes the binary size savings from pruning operators in ONNX Runtime for embedding model use cases.
 
 ## Measured Binary Sizes
 
 Built from ONNX Runtime v1.24.0 (main branch) with `--config MinSizeRel --build_shared_lib`:
 
-| Build | Size (bytes) | Size (MiB) |
-|-------|-------------|------------|
-| WITH contrib_ops | 19,328,992 | 18.43 |
-| WITHOUT contrib_ops (`--disable_contrib_ops`) | 16,251,688 | 15.50 |
-| **Difference** | **3,077,304** | **2.93** |
-| **Reduction** | **15.9%** | |
+| Build | Size (bytes) | Size (MiB) | vs Full |
+|-------|-------------|------------|---------|
+| Full (with all contrib_ops) | 19,328,992 | 18.43 | baseline |
+| `--disable_contrib_ops` | 16,251,688 | 15.50 | -15.9% |
+| **`--include_ops_by_config` (embedding ops only)** | **10,475,624** | **9.99** | **-45.8%** |
 
-## Important Caveat
+### Summary
 
-**`--disable_contrib_ops` removes ALL contrib operators**, including those needed for optimized BERT inference:
-- `EmbedLayerNorm` - fused embedding + layer normalization
-- `Attention`, `MultiHeadAttention` - optimized attention operations
-- `BiasGelu`, `FastGelu` - fused activation functions
-- Quantization operators
+- Disabling all contrib_ops saves **~3 MB (16%)**
+- Selective pruning to embedding-only ops saves **~9 MB (46%)**
 
-Embedding models exported with these fused operators will **fail to run** without contrib_ops.
+## Operator Config for Embedding Models
 
-For selective pruning, use `--include_ops_by_config` with a config file listing only the operators your models need.
+Generated from `Qdrant/bge-small-en-v1.5-onnx-Q` optimized model:
 
-## Source Code Breakdown
+```
+ai.onnx;11;Add,Cast,Constant,Gather,LayerNormalization,MatMul,ReduceSum,Shape,Slice,Unsqueeze
+com.microsoft;1;Attention,FastGelu,SkipLayerNormalization
+```
 
-| Directory | Size | Purpose |
-|-----------|------|---------|
-| `contrib_ops/cpu/` | 1.5 MB | CPU operators |
-| ├── `cpu/transformers/` | 414 KB | beam_search, greedy_search, sampling |
-| ├── `cpu/bert/` | 282 KB | attention, EmbedLayerNorm, BiasGelu |
-| ├── `cpu/quantization/` | 268 KB | Quantization support |
-| ├── `cpu/moe/` | 102 KB | Mixture of Experts |
-| └── others | ~400 KB | attnlstm, sparse, utils, tensor, math |
+Only 13 operators needed:
+- **10 standard ONNX ops**: Add, Cast, Constant, Gather, LayerNormalization, MatMul, ReduceSum, Shape, Slice, Unsqueeze
+- **3 contrib ops**: Attention, FastGelu, SkipLayerNormalization
 
-### What embeddings DON'T need:
-- `cpu/transformers/*` - autoregressive generation ops (beam_search, greedy_search, sampling)
-- `cpu/moe/*` - Mixture of Experts
-- `cpu/attnlstm/*` - LSTM attention variants
-- `cpu/aten_ops/*` - PyTorch ATen compatibility
+## What Gets Pruned
 
-## How to Use with fastembed-rs
+With selective pruning, these are excluded:
 
-fastembed-rs supports dynamic ONNX Runtime loading via the `ort-load-dynamic` feature:
+**Contrib ops not needed for embeddings:**
+- `cpu/transformers/*` - beam_search, greedy_search, sampling (414 KB source)
+- `cpu/moe/*` - Mixture of Experts (102 KB source)
+- `cpu/attnlstm/*` - LSTM attention (78 KB source)
+- `cpu/aten_ops/*` - PyTorch ATen compatibility (12 KB source)
+- Most of `cpu/bert/*` except Attention
+- All quantization ops (unless using quantized models)
+
+**Standard ONNX ops not needed:**
+- Convolution operators
+- RNN/LSTM operators
+- Many math/tensor operations unused by transformers
+
+## How to Build
+
+```bash
+# 1. Clone ONNX Runtime
+git clone --depth 1 https://github.com/microsoft/onnxruntime.git
+cd onnxruntime
+
+# 2. Generate config from your embedding models
+pip install onnx flatbuffers
+python tools/python/create_reduced_build_config.py /path/to/models/ ops.config
+
+# 3. Build with selective ops
+./build.sh --config MinSizeRel --build_shared_lib --parallel \
+    --skip_tests --include_ops_by_config ops.config
+```
+
+## Using with fastembed-rs
+
+fastembed-rs supports dynamic ONNX Runtime loading:
 
 ```toml
 [dependencies]
 fastembed = { version = "5.5", default-features = false, features = ["ort-load-dynamic", "hf-hub-native-tls"] }
 ```
 
-Then build a custom ONNX Runtime and set `ORT_DYLIB_PATH` to point to it.
+Then set `ORT_DYLIB_PATH` to point to your custom-built library.
 
-## Build Commands
+## Caveats
+
+1. The config must include all operators used by your models
+2. Different embedding models may use different operators
+3. Quantized models need additional quantization operators
+4. ONNX Runtime optimizations may add new operators at runtime
+
+To ensure compatibility, generate the config from all models you plan to use:
 
 ```bash
-# Clone ONNX Runtime
-git clone --depth 1 https://github.com/microsoft/onnxruntime.git
-
-# Build with contrib_ops (default)
-./build.sh --config MinSizeRel --build_shared_lib --parallel --skip_tests --allow_running_as_root
-
-# Build without contrib_ops
-./build.sh --config MinSizeRel --build_shared_lib --parallel --skip_tests --allow_running_as_root --disable_contrib_ops
-
-# Build with selective ops (recommended for embeddings)
-python tools/python/create_reduced_build_config.py --model_path model.onnx --output_path ops.config
-./build.sh --config MinSizeRel --build_shared_lib --parallel --skip_tests --allow_running_as_root --include_ops_by_config ops.config
+# Put all your ONNX models in a directory
+python tools/python/create_reduced_build_config.py /path/to/all/models/ ops.config
 ```
 
 ## References
