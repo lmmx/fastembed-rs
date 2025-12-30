@@ -1,6 +1,6 @@
-# ONNX Runtime contrib_ops Analysis for fastembed-rs
+# ONNX Runtime contrib_ops Size Analysis for fastembed-rs
 
-This document analyzes the potential space savings from pruning the contrib_ops directory in ONNX Runtime for embedding model use cases.
+This document analyzes the potential binary size savings from pruning the contrib_ops directory in ONNX Runtime for embedding model use cases.
 
 ## Source Code Size Analysis
 
@@ -50,51 +50,55 @@ ONNX Runtime Python wheel sizes (CPU-only, v1.23.2):
 
 ### CPU-only builds (fastembed-rs default):
 
-**Prunable contrib_ops:**
+**Prunable contrib_ops source code:**
 - `cpu/transformers/`: 414 KB (generation ops)
 - `cpu/moe/`: 102 KB
 - `cpu/attnlstm/`: 78 KB
 - `cpu/aten_ops/`: 12 KB
-- **Total prunable: ~606 KB** of 1.5 MB (~40% of CPU contrib_ops)
+- **Total prunable: ~606 KB** of 1.5 MB (~40% of CPU contrib_ops source)
 
-**Binary size impact:**
-- CPU contrib_ops ≈ 4-5% of total binary
+**Binary size estimate:**
+- CPU contrib_ops source is ~4.3% of total source (1.5 MB / 34.5 MB)
+- 40% of that is prunable for embeddings
 - **Estimated savings: 0.6-1.2 MB** (3-7% of ~17 MB binary)
 
 ### CUDA builds:
 
-The 159 MB of pre-compiled .cubin.cc files in cuda/bert/ are fused attention kernels for different GPU architectures (sm70, sm75, sm80, sm86, sm89). These provide significant performance benefits for BERT inference on GPU.
+**Prunable CUDA contrib_ops:**
+- `cuda/llm/`: 792 KB
+- `cuda/diffusion/`: 72 KB
+- `cuda/moe/`: 582 KB
+- Parts of `cuda/transformers/`: ~100 KB (generation-specific code)
 
-**Note:** Removing these would impact GPU inference performance, not just binary size.
+The 159 MB of pre-compiled .cubin.cc files in cuda/bert/ are fused attention kernels for GPU architectures (sm70, sm75, sm80, sm86, sm89). These are used for BERT inference, so they would need to be kept for embedding models using GPU.
 
-## Important Caveats
+**Estimated CUDA prunable: ~1.5 MB** (excluding the cubin files needed for embeddings)
 
-1. **Cannot use `--disable_contrib_ops`**: Embedding models DO use some contrib ops like `EmbedLayerNorm` and fused attention. Disabling all contrib ops would break optimized embedding models.
+## Implementation Notes
 
-2. **Correct approach**: Use `--include_ops_by_config <config_file>` with a config listing only operators your models use.
+1. **Cannot use `--disable_contrib_ops`**: Embedding models use some contrib ops like `EmbedLayerNorm` and fused attention. Disabling all contrib ops would break optimized embedding models.
 
-3. **fastembed-rs uses prebuilt binaries**: The `ort` crate downloads prebuilt ONNX Runtime binaries from pykeio's CDN, which include full contrib_ops. Custom-building would require significant effort.
+2. **Use `--include_ops_by_config`**: The ONNX Runtime build system supports selective operator inclusion via a config file generated from your target models.
 
-## Recommendations
+3. **Current fastembed-rs setup**: The `ort` crate downloads prebuilt ONNX Runtime binaries from pykeio's CDN which include full contrib_ops.
 
-### For minimal impact on binary size:
+## How to Measure Precisely
 
-The savings from pruning contrib_ops (~0.6-1.2 MB) are relatively small compared to:
-- The complexity of maintaining custom ONNX Runtime builds
-- Model file sizes (typically 20-400 MB per model)
-- The `ort` crate's reliance on prebuilt binaries
+To get exact binary size savings:
 
-### If you want to pursue this:
+1. Generate operator config from embedding models:
+   ```bash
+   python onnxruntime/tools/python/create_reduced_build_config.py \
+       --model_path path/to/embedding_model.onnx \
+       --output_path reduced_ops.config
+   ```
 
-1. Use ONNX Runtime's `create_reduced_build_config.py` script with your target models
-2. Build with `--include_ops_by_config <generated_config>`
-3. Fork/modify the `ort` crate to use your custom-built libraries
+2. Build ONNX Runtime with reduced operators:
+   ```bash
+   ./build.sh --config MinSizeRel --include_ops_by_config reduced_ops.config
+   ```
 
-### Alternative approaches for reducing overall footprint:
-
-1. Use quantized models (already supported in fastembed-rs)
-2. Use smaller embedding models (e.g., all-MiniLM-L6-v2 at 22MB vs BGE-large at 1.3GB)
-3. Consider alternative ONNX Runtime backends (ort-candle, ort-tract) for pure-Rust solutions
+3. Compare resulting `libonnxruntime.so` sizes with and without the config.
 
 ## References
 
