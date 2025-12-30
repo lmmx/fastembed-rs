@@ -146,6 +146,23 @@ This could be particularly valuable for:
 - Container images where smaller is better
 - Applications that only need embedding inference
 
+## Reproducing These Results
+
+Scripts to reproduce these measurements are provided in [`docs/scripts/`](scripts/):
+
+```bash
+# Run all three builds and compare sizes
+./docs/scripts/compare-builds.sh
+
+# Or run individual steps:
+./docs/scripts/generate-ops-config.sh    # Generate operator config
+./docs/scripts/build-onnxruntime.sh full       # Build with all ops
+./docs/scripts/build-onnxruntime.sh no-contrib # Build without contrib ops
+./docs/scripts/build-onnxruntime.sh selective  # Build with embedding ops only
+```
+
+See [`docs/scripts/README.md`](scripts/README.md) for requirements and details.
+
 ## References
 
 - [ONNX Runtime Reduced Operator Kernel Build](https://github.com/microsoft/onnxruntime/blob/main/docs/Reduced_Operator_Kernel_build.md)
